@@ -1,0 +1,16 @@
+torch>=2.3
+torchvision>=0.18
+numpy
+scipy
+pillow
+matplotlib
+huggingface_hub>=0.24
+onnx
+onnxruntime-gpu; sys_platform == "linux"
+onnxruntime; sys_platform != "linux"
+onnxconverter-common
+fastapi
+uvicorn
+python-multipart
+opencv-python-headless
+pytest
