@@ -5,9 +5,9 @@ from svf.builders import build_backbone
 from svf.hub import load_checkpoint
 
 
-def load_backbone(name, img, ckpt=None):
+def load_backbone(name, img, ckpt=None, output_stride=32):
     """ckpt: local path or '<tag>/backbone.pt' on the hub; None = random init (or supervised for sup_*)."""
-    bb = build_backbone(name, img)
+    bb = build_backbone(name, img, output_stride=output_stride)
     if ckpt:
         st = load_checkpoint(ckpt if Path(ckpt).exists() else Path("checkpoints") / ckpt, remote=ckpt)
         missing, unexpected = bb.load_state_dict(st["backbone"], strict=False)

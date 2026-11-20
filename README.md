@@ -1,11 +1,11 @@
 # Self-Supervised Vision Foundation Model — CNN vs Vision Transformer
 
-Two backbones pre-trained **without labels** — a from-scratch ResNet with **SimCLR** and a ViT with **MAE** — then
-fine-tuned under identical heads for classification, segmentation and detection, and compared against a
-supervised ImageNet ResNet on accuracy, data efficiency and deployment speed.
+Two backbones pre-trained **without labels**: a from-scratch ResNet-18 with **SimCLR** and a ViT-Tiny with **MAE**, then
+fine-tuned under identical heads for classification, segmentation and detection, and compared against
+scratch and supervised-ImageNet ResNet-18 baselines on accuracy, data efficiency and deployment speed.
 
-> Status: code complete and CPU-tested (`pytest`: 17 pass). Training runs on cloud GPUs and has not been run yet;
-> the results tables below fill in from `results/*.jsonl`.
+> Status: code complete, tested, and smoke-tested end to end on GPU. Results fill in from `results/*.jsonl`
+> when the Colab grid finishes.
 
 ## What is implemented (all original PyTorch modules)
 
@@ -23,34 +23,46 @@ supervised ImageNet ResNet on accuracy, data efficiency and deployment speed.
 | Metrics: top-1, Dice, mIoU, COCO mAP@0.5:0.95 + per-class AP | `svf/metrics.py` |
 | ONNX FP32/FP16/INT8 (ORT static QDQ), TensorRT via trtexec, benchmarks | `svf/export.py` |
 | Checkpoints mirrored to the Hugging Face Hub, auto-resume | `svf/hub.py` |
+| Resumable experiment grid (skips finished runs, epoch-level resume) | `scripts/run_grid.py` |
 
-## Protocol
+## Protocol (sized for a single free Colab T4)
 
-* **Pre-training data** (unlabelled): ImageNet-100 subset, CIFAR-10 images, MVTec AD images (labels/masks never read).
-* **Linear probe**: frozen backbone + BN + linear layer (seg: frozen backbone, head trained).
-* **Full fine-tune**: backbone LR = head LR / 10, AdamW, cosine.
-* **Same heads per task**: segmentation = DeepLabv3 on CNNs / SegFormer decoder on ViT; detection = RetinaNet+FPN
-  on CNNs, DETR on ViT, plus a DETR-on-every-backbone run so one head is literally shared.
-* **Data efficiency**: 1 / 10 / 25 / 50 / 100 % of labels, fixed seeds.
-* **Ablations**: MAE mask ratio 0.5 / 0.6 / 0.75 / 0.9; probe-vs-finetune gap.
+All experiments run at **96×96 px** so the whole grid fits one T4 (~25–30 GPU hours, spread over sessions).
+
+* **Pre-training (no labels):** ImageNet-100 subset (300 img/class) + CIFAR-10 train images + MVTec AD images;
+  labels and masks are never read. SimCLR → ResNet-18, MAE (mask 75 %) → ViT-Tiny (patch 4), 100 epochs each.
+* **Baselines:** the same ResNet-18 trained from scratch, and torchvision's supervised ImageNet-1k ResNet-18
+  (an upper reference: 1.28 M labelled images vs our ~85 k unlabelled ones).
+* **Tasks, identical heads per backbone family:**
+  CIFAR-10 classification (linear probe + full fine-tune) · MVTec AD defect segmentation (DeepLabv3 on CNNs,
+  SegFormer decoder on ViT) · NEU-DET surface-defect detection (RetinaNet+FPN on CNNs, DETR on ViT, plus DETR on
+  every CNN so one head is literally shared).
+* **Linear probe:** frozen backbone + BN + linear layer. **Full fine-tune:** backbone LR = head LR / 10, AdamW, cosine.
+* **Data efficiency:** CIFAR-10 at 1 / 10 / 100 % labels; MVTec segmentation at 10 / 25 / 100 %.
+* **Ablation:** MAE mask ratio 50 / 75 / 90 % (30-epoch pre-training, CIFAR-10 linear probe).
+* **Deployment:** PyTorch vs ONNX FP32 / FP16 / INT8 latency and size.
 
 ## Running
 
+**On Colab (recommended):** open `notebooks/colab_train.ipynb`, choose a T4 GPU, and click **Run all**, every time.
+Datasets are downloaded once and cached on Google Drive as tar files; checkpoints and results are written straight
+to Drive (saved every epoch). After a disconnect, *Run all* again: finished runs are skipped and an interrupted one
+resumes from its last epoch. The last cell writes the results into this README and pushes them.
+
+**Locally:**
 ```bash
 pip install -r requirements.txt
 pytest -q tests                                   # CPU, ~20 s
 python scripts/download_data.py mvtec             # HF mirror; official MVTec links are dead
 python scripts/download_data.py imagenet100 --per-class 300
-python scripts/download_data.py neu               # Kaggle API
-bash scripts/run_all.sh                           # full grid (GPU)
-python scripts/plot_results.py                    # data-efficiency curves, ablation, gap table
+python scripts/download_data.py neu               # or the anonymous Kaggle URL used in the notebook
+python scripts/run_grid.py --smoke                # every stage for a few steps
+python scripts/run_grid.py                        # full resumable grid -> results/summary.md + plots
 ```
-
-GPU runs: `notebooks/colab_train.ipynb` (Colab or Kaggle). Set `HF_TOKEN` as a notebook secret.
 
 ### Hugging Face checkpoints
 `HF_TOKEN` and `HF_REPO` come from the environment or a local `.env` (gitignored, never commit it).
-Pre-training pushes `checkpoints/<tag>/last.pt` every `--save-every` epochs and `backbone.pt` at the end;
+Optional backup on top of Drive (enabled when `HF_PUSH=1`; the notebook sets it if an `HF_TOKEN` secret exists). Pre-training pushes `checkpoints/<tag>/last.pt` every `--save-every` epochs and `backbone.pt` at the end;
 fine-tunes push their best checkpoint. A restarted run pulls `last.pt` from the Hub and resumes, so
 Colab disconnects only cost the epochs since the last push.
 
@@ -61,4 +73,4 @@ SVF_DET=checkpoints/finetune/<det>.pt SVF_SEG=checkpoints/finetune/<seg>.pt uvic
 `POST /predict/image`: boxes + defect mask (RLE). `POST /predict/video`: per-frame boxes with ByteTrack IDs.
 
 ## Results
-_Fill from `results/` after the GPU runs: headline table, `data_eff_*.png`, `mae_mask_ratio.png`, export table._
+_Filled in automatically by the notebook's last cell (`scripts/update_readme.py`) once the grid finishes._

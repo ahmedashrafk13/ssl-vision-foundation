@@ -23,6 +23,19 @@ def cosine_lr(opt, step, total, base, warmup):
     return lr
 
 
+@torch.no_grad()
+def amp_ok(net, img, dev, bs):
+    """fp16 self-test: some GPUs (GTX 16xx) return NaN from fp16 cuDNN convs. Fall back to fp32 there."""
+    import copy
+    probe = copy.deepcopy(net).train()  # copy, so the test cannot touch the real BN statistics
+    with torch.autocast(dev, dtype=torch.float16):
+        out = probe(torch.randn(bs, 3, img, img, device=dev))
+    ok_bn = all(torch.isfinite(b).all() for b in probe.buffers() if b.dtype.is_floating_point)
+    ok = bool(torch.isfinite(out.float()).all()) and ok_bn
+    print("mixed precision:", "fp16" if ok else "OFF (this GPU returns NaN in fp16; using fp32)")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", choices=["simclr", "mae"], required=True)
@@ -56,10 +69,11 @@ def main():
         lr = a.lr or 1.5e-4 * a.bs / 256
         opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.05)
     model.to(dev)
+    use_amp = dev == "cuda" and amp_ok(model.backbone if a.method == "simclr" else model.encoder, a.img, dev, a.bs)
     ds = unlabelled_pool(a.data, tf, a.sources.split(","))
     dl = DataLoader(ds, a.bs, shuffle=True, num_workers=a.workers, drop_last=True, pin_memory=True,
                     persistent_workers=a.workers > 0)
-    scaler = torch.amp.GradScaler(enabled=dev == "cuda")
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     start, step = 0, 0
     last = ckdir / "last.pt"
     try:
@@ -76,9 +90,11 @@ def main():
         t0, run = time.time(), 0.0
         for i, (x, _) in enumerate(dl):
             cur = cosine_lr(opt, step, total, lr, warmup=10 * len(dl) if a.epochs > 20 else len(dl))
-            with torch.autocast(dev, dtype=torch.bfloat16 if dev == "cpu" else torch.float16, enabled=dev == "cuda"):
+            with torch.autocast(dev, dtype=torch.bfloat16 if dev == "cpu" else torch.float16, enabled=use_amp):
                 loss = model(x[0].to(dev, non_blocking=True), x[1].to(dev, non_blocking=True), a.temperature) \
                     if a.method == "simclr" else model(x.to(dev, non_blocking=True))[0]
+            if not torch.isfinite(loss):  # never let one bad batch poison weights / BN statistics
+                raise RuntimeError(f"non-finite loss at step {step}; restart resumes from the last epoch")
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
@@ -86,11 +102,17 @@ def main():
             if a.max_steps and step >= a.max_steps:
                 break
         print(f"ep {ep} loss {run / (i + 1):.4f} lr {cur:.2e} {time.time() - t0:.0f}s", flush=True)
+        bad = [k for k, v in model.state_dict().items() if v.dtype.is_floating_point and not torch.isfinite(v).all()]
+        if bad:  # never save a corrupted state; a rerun resumes from the last good epoch
+            raise RuntimeError(f"non-finite weights/BN stats after epoch {ep}: {bad[:4]}")
         state = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": ep, "step": step, "args": vars(a)}
         save_checkpoint(state, last, push=(ep + 1) % a.save_every == 0 or ep + 1 == a.epochs)
         if a.max_steps and step >= a.max_steps:
             break
     bb = model.backbone if a.method == "simclr" else model.encoder
+    bad = [k for k, v in bb.state_dict().items() if v.dtype.is_floating_point and not torch.isfinite(v).all()]
+    if bad:
+        raise RuntimeError(f"refusing to save a backbone with non-finite weights/BN stats: {bad[:4]}")
     save_checkpoint({"backbone": bb.state_dict(), "name": a.backbone, "img": a.img, "method": a.method},
                     ckdir / "backbone.pt")
 

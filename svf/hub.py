@@ -37,7 +37,7 @@ def save_checkpoint(state, path, push=True, keep_remote_as=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
-    if push:
+    if push and os.environ.get("HF_PUSH") == "1":  # opt-in: a slow upload must never stall training
         api, repo = _api()
         if api:
             remote = keep_remote_as or path.as_posix().split("checkpoints/", 1)[-1]

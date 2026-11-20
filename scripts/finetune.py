@@ -6,6 +6,7 @@
 All results are appended to results/results.jsonl for the comparison plots.
 """
 import argparse, time
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,12 +76,15 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--tag", default=None, help="run name (results key / resume file)")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    bb = load_backbone(a.backbone, a.img, a.ckpt)
+    # segmentation: dilated CNN, output stride 8 (DeepLabv3); weights are identical, only strides change
+    bb = load_backbone(a.backbone, a.img, a.ckpt, output_stride=8 if a.task == "seg" and "vit" not in a.backbone else 32)
     src = a.ckpt.split("/")[0] if a.ckpt else ("supervised" if a.backbone.startswith("sup_") else "scratch")
-    tag = f"{a.task}_{a.mode}_{a.backbone}_{src}_f{a.label_frac}_s{a.seed}"
+    head = f"_{a.det_head}" if a.task == "det" and a.det_head else ""
+    tag = a.tag or f"{a.task}_{a.mode}_{a.backbone}_{src}{head}_f{a.label_frac}_s{a.seed}"
 
     if a.task == "cls":
         tr, va, n = cls_data(a)
@@ -106,8 +110,14 @@ def main():
     dl = DataLoader(tr, a.bs, shuffle=True, num_workers=a.workers, collate_fn=collate, drop_last=len(tr) > a.bs)
     vdl = DataLoader(va, a.bs, num_workers=a.workers, collate_fn=collate)
     is_detr = isinstance(model, DETR)
-    best, step = None, 0
-    for ep in range(a.epochs):
+    best, step, start = None, 0, 0
+    resume = Path(f"checkpoints/finetune/{tag}.resume.pt")
+    if resume.exists():  # epoch-level resume after a disconnect
+        st = torch.load(resume, map_location="cpu", weights_only=False)
+        model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"])
+        best, step, start = st["best"], st["step"], st["epoch"] + 1
+        print(f"resumed {tag} from epoch {start}")
+    for ep in range(start, a.epochs):
         model.train()
         if a.mode == "probe":
             bb.eval()
@@ -141,12 +151,15 @@ def main():
             best = metrics
             save_checkpoint({"model": model.state_dict(), "args": vars(a), "metrics": metrics},
                             f"checkpoints/finetune/{tag}.pt", push=False)
+        save_checkpoint({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                         "best": best, "step": step, "epoch": ep}, resume, push=False)
         if a.max_steps and step >= a.max_steps:
             break
-    save_checkpoint({"model": model.state_dict(), "args": vars(a), "metrics": best},
-                    f"checkpoints/finetune/{tag}.pt")  # push best-so-far file once at the end
+    best_ck = torch.load(f"checkpoints/finetune/{tag}.pt", map_location="cpu", weights_only=False)
+    save_checkpoint(best_ck, f"checkpoints/finetune/{tag}.pt")  # push the best checkpoint once at the end
     log_result("results/results.jsonl", {"tag": tag, **{k: v for k, v in vars(a).items() if k != "data"},
                                          "source": src, **{k: v for k, v in best.items() if not isinstance(v, (list, dict))}})
+    resume.unlink(missing_ok=True)
 
 
 @torch.no_grad()
