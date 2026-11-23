@@ -36,7 +36,10 @@ def save_checkpoint(state, path, push=True, keep_remote_as=None):
     """Save locally; if HF creds are set, upload to <HF_REPO>/<keep_remote_as or relative path>."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, path)
+    # write-then-rename: a disconnect mid-save (Colab -> Drive) must never leave a truncated checkpoint
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
     if push and os.environ.get("HF_PUSH") == "1":  # opt-in: a slow upload must never stall training
         api, repo = _api()
         if api:

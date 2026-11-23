@@ -5,12 +5,16 @@ interrupted run resumes from its last saved epoch.
   python scripts/run_grid.py            # full grid (sized for one Colab T4, ~25-30 GPU hours total)
   python scripts/run_grid.py --smoke    # few-step end-to-end check of every stage (~5 min)
 """
-import argparse, atexit, json, os, subprocess, sys
+import argparse, atexit, json, os, subprocess, sys, time
+from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 IMG = 96
+LOGS = ROOT / "logs" / "grid"  # on Colab logs/ is a symlink into Drive, so these survive a disconnect
+FAILED = []  # (name, exit code, log path, last lines)
+STRICT = False  # smoke: stop at the first failure
 
 
 def done_tags(f="results/results.jsonl"):
@@ -18,9 +22,29 @@ def done_tags(f="results/results.jsonl"):
     return {json.loads(l).get("tag") for l in p.read_text().splitlines() if l.strip()} if p.exists() else set()
 
 
-def run(cmd):
-    print("\n>>>", " ".join(cmd), flush=True)
-    subprocess.run([PY, *cmd], cwd=ROOT, check=True)
+def run(cmd, name, retries=1):
+    """Run one stage, teeing its output to logs/grid/<name>.log. A failed stage is retried once (it resumes
+    from its last epoch, which clears transient Drive / CUDA hiccups); if it fails again it is recorded and
+    the grid moves on to independent stages instead of throwing away the rest of the session."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log = LOGS / f"{name}.log"
+    for attempt in range(retries + 1):
+        print("\n>>>", " ".join(cmd), f"(retry {attempt})" if attempt else "", flush=True)
+        tail = deque(maxlen=40)
+        with log.open("a", encoding="utf-8", buffering=1) as f:
+            f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} attempt {attempt + 1}: {' '.join(cmd)}\n")
+            p = subprocess.Popen([PY, "-u", *cmd], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace", bufsize=1)
+            for line in p.stdout:
+                sys.stdout.write(line); f.write(line); tail.append(line)
+            rc = p.wait()
+        if rc == 0:
+            return True
+        print(f"\n!!! {name} FAILED (exit {rc}). Last lines:\n" + "".join(tail), flush=True)
+        if STRICT:
+            sys.exit(f"stage {name} failed; full log: {log}")
+    FAILED.append((name, rc, log, "".join(list(tail)[-15:])))
+    return False
 
 
 def main():
@@ -31,6 +55,8 @@ def main():
     a = ap.parse_args()
     stages = set(a.only.split(",")) if a.only else {"pretrain", "ablation", "finetune", "export", "plots"}
     sm = a.smoke
+    global STRICT
+    STRICT = sm
     pre = ["--max-steps", "3", "--bs", "32"] if sm else []
     ft = ["--max-steps", "3", "--epochs", "1", "--bs", "8"] if sm else []  # small batch: smoke fits a 4 GB GPU
     W = ["--workers", a.workers]
@@ -57,7 +83,8 @@ def main():
         if (ROOT / "checkpoints" / tag / "backbone.pt").exists():
             print(f"skip pretrain {tag} (done)")
             continue
-        run(["scripts/pretrain.py", *args, "--img", str(IMG), "--out", tag, "--save-every", "5", *W, *pre])
+        run(["scripts/pretrain.py", *args, "--img", str(IMG), "--out", tag, "--save-every", "5", *W, *pre],
+            f"pretrain_{tag}")
 
     # ---------- 2) downstream: identical heads per task, 4 backbones ----------
     jobs = []
@@ -86,6 +113,9 @@ def main():
         if tag in done:
             print(f"skip {tag} (done)")
             continue
+        if j["ck"] and not (ROOT / "checkpoints" / j["ck"]).exists():
+            print(f"skip {tag} (waiting for pre-trained backbone {j['ck']})")
+            continue
         cmd = ["scripts/finetune.py", "--task", j["task"], "--mode", j["mode"], "--backbone", j["bb"],
                "--img", str(IMG), "--label-frac", str(j["frac"]), "--epochs", str(j["ep"]), "--tag", tag, *W]
         if j["ck"]:
@@ -97,7 +127,7 @@ def main():
             cmd += ["--bs", "64" if j["bb"] == "vit_tiny" and j["mode"] == "full" else "128", "--lr", "3e-4" if j["mode"] == "full" else "1e-3"]
         else:
             cmd += ["--bs", "16"]
-        run(cmd + ft)
+        run(cmd + ft, tag)
 
     # ---------- 3) deployment benchmark ----------
     if "export" in stages:
@@ -105,13 +135,24 @@ def main():
         have = {json.loads(l)["backbone"] for l in ex.read_text().splitlines() if l.strip()} if ex.exists() else set()
         for bb, ck, src in specs[:3]:
             if bb not in have or sm:
-                run(["scripts/export_bench.py", "--backbone", bb, "--img", str(IMG), *(["--ckpt", ck] if ck else [])])
+                if ck and not (ROOT / "checkpoints" / ck).exists():
+                    print(f"skip export {bb} (waiting for {ck})")
+                    continue
+                run(["scripts/export_bench.py", "--backbone", bb, "--img", str(IMG), *(["--ckpt", ck] if ck else [])],
+                    f"export_{bb}{sfx}")
 
     if sm:
         print("\nSMOKE TEST PASSED")
         return
-    if "plots" in stages:
-        run(["scripts/plot_results.py"])
+    if "plots" in stages and (ROOT / "results/results.jsonl").exists():
+        run(["scripts/plot_results.py"], "plots", retries=0)  # partial tables are still useful mid-grid
+    if FAILED:
+        print("\n" + "=" * 70 + f"\n{len(FAILED)} stage(s) FAILED twice; everything else that could run has run.")
+        for name, rc, log, tail in FAILED:
+            print(f"\n--- {name} (exit {rc}) full log: {log}\n{tail}")
+        print("Run all again to retry them (they resume from their last saved epoch).")
+        sys.exit(1)
+    print("\nGRID COMPLETE")
 
 
 if __name__ == "__main__":

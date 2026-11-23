@@ -3,7 +3,7 @@
   python scripts/pretrain.py --method simclr --backbone resnet18 --img 96 --epochs 200
   python scripts/pretrain.py --method mae --backbone vit_tiny --img 96 --mask-ratio 0.75 --epochs 400
 """
-import argparse, math, sys, time
+import argparse, math, os, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
@@ -76,32 +76,48 @@ def main():
     scaler = torch.amp.GradScaler(enabled=use_amp)
     start, step = 0, 0
     last = ckdir / "last.pt"
+    st = None
     try:
-        st = load_checkpoint(last, remote=f"{tag}/last.pt")
+        if last.exists() or os.environ.get("HF_REPO"):
+            st = load_checkpoint(last, remote=f"{tag}/last.pt")
+    except Exception as e:  # no remote copy, or a file truncated by an old non-atomic save
+        if last.exists():
+            print(f"WARNING: {last} is unreadable ({e}); moved aside, {tag} starts from scratch", flush=True)
+            last.replace(last.with_name("last.pt.corrupt"))
+    if st:  # outside the try: an architecture mismatch must fail loudly, not silently restart
         model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"])
         start, step = st["epoch"] + 1, st["step"]
         print(f"resumed {tag} from epoch {start}")
-    except Exception:
-        pass
+    bufs = [b for b in model.buffers() if b.dtype.is_floating_point]  # BN running stats
     total = a.epochs * len(dl)
     print(f"{tag}: {len(ds)} images, {len(dl)} steps/epoch, device={dev}")
     for ep in range(start, a.epochs):
         model.train()
-        t0, run = time.time(), 0.0
+        t0, run, good, skipped = time.time(), 0.0, 0, 0
         for i, (x, _) in enumerate(dl):
             cur = cosine_lr(opt, step, total, lr, warmup=10 * len(dl) if a.epochs > 20 else len(dl))
+            saved = [b.clone() for b in bufs]
             with torch.autocast(dev, dtype=torch.bfloat16 if dev == "cpu" else torch.float16, enabled=use_amp):
                 loss = model(x[0].to(dev, non_blocking=True), x[1].to(dev, non_blocking=True), a.temperature) \
                     if a.method == "simclr" else model(x.to(dev, non_blocking=True))[0]
-            if not torch.isfinite(loss):  # never let one bad batch poison weights / BN statistics
-                raise RuntimeError(f"non-finite loss at step {step}; restart resumes from the last epoch")
+            step += 1
+            if not torch.isfinite(loss):  # one fp16 overflow: skip the batch, undo its BN-stat update
+                for b, s in zip(bufs, saved):
+                    b.copy_(s)
+                skipped += 1
+                print(f"  step {step}: non-finite loss, batch skipped ({skipped} this epoch)", flush=True)
+                if skipped > max(20, len(dl) // 50):
+                    raise RuntimeError(f"{skipped} non-finite losses in epoch {ep}: training diverged "
+                                       f"(lr {cur:.2e}); a rerun resumes from the last good epoch")
+                continue
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
-            run += loss.item(); step += 1
+            run += loss.item(); good += 1
             if a.max_steps and step >= a.max_steps:
                 break
-        print(f"ep {ep} loss {run / (i + 1):.4f} lr {cur:.2e} {time.time() - t0:.0f}s", flush=True)
+        print(f"ep {ep} loss {run / max(good, 1):.4f} lr {cur:.2e} {time.time() - t0:.0f}s"
+              + (f" ({skipped} skipped)" if skipped else ""), flush=True)
         bad = [k for k, v in model.state_dict().items() if v.dtype.is_floating_point and not torch.isfinite(v).all()]
         if bad:  # never save a corrupted state; a rerun resumes from the last good epoch
             raise RuntimeError(f"non-finite weights/BN stats after epoch {ep}: {bad[:4]}")

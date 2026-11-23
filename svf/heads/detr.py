@@ -42,7 +42,8 @@ def hungarian_match(logits, boxes, targets, w_cls=1.0, w_l1=5.0, w_giou=2.0):
         cost = (-w_cls * prob[:, t["labels"]] + w_l1 * torch.cdist(bx, t["boxes"], p=1)
                 - w_giou * generalized_box_iou(box_convert(bx, "cxcywh", "xyxy"),
                                                box_convert(t["boxes"], "cxcywh", "xyxy")))
-        r, c = linear_sum_assignment(cost.cpu().numpy())
+        # scipy raises on NaN/inf; one bad batch must not kill a 100-epoch run (its loss is skipped anyway)
+        r, c = linear_sum_assignment(torch.nan_to_num(cost.float(), 1e6, 1e6, -1e6).cpu().numpy())
         out.append((torch.as_tensor(r, dtype=torch.long), torch.as_tensor(c, dtype=torch.long)))
     return out
 

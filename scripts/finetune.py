@@ -112,8 +112,14 @@ def main():
     is_detr = isinstance(model, DETR)
     best, step, start = None, 0, 0
     resume = Path(f"checkpoints/finetune/{tag}.resume.pt")
+    st = None
     if resume.exists():  # epoch-level resume after a disconnect
-        st = torch.load(resume, map_location="cpu", weights_only=False)
+        try:
+            st = torch.load(resume, map_location="cpu", weights_only=False)
+        except Exception as e:  # truncated by an old non-atomic save: start this run over
+            print(f"WARNING: {resume} is unreadable ({e}); moved aside, {tag} starts from scratch", flush=True)
+            resume.replace(resume.with_name(resume.name + ".corrupt"))
+    if st:
         model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"])
         best, step, start = st["best"], st["step"], st["epoch"] + 1
         print(f"resumed {tag} from epoch {start}")
@@ -137,10 +143,13 @@ def main():
                 else:
                     loss = sum(model.loss(*model(x), t).values())
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            opt.step()
             step += 1
+            if not torch.isfinite(loss):  # skip the batch rather than step the weights into NaN
+                print(f"  step {step}: non-finite loss, batch skipped", flush=True)
+                continue
+            loss.backward()
+            if torch.isfinite(torch.nn.utils.clip_grad_norm_(params, 1.0)):
+                opt.step()
             if a.max_steps and step >= a.max_steps:
                 break
         sched.step()
