@@ -20,11 +20,20 @@ def main():
     rows = [bench_torch(bb, a.img, a.batch)]
     fp32 = export_onnx(bb, f"{base}.onnx", a.img)
     calib = np.random.randn(32, 3, a.img, a.img).astype(np.float32)  # swap for real val images for final numbers
-    for f in (fp32, to_fp16(fp32), to_int8(fp32, calib)):
-        rows.append(bench_ort(f, a.img, a.batch))
-    eng = build_trt(fp32)
-    if eng:
-        rows.append({"file": eng.name, "provider": "tensorrt"})
+    # each format is independent: a converter bug in one (e.g. FP16 on a ViT) becomes an 'error' row in the
+    # deployment table instead of discarding the whole benchmark
+    for name, make in (("fp32", lambda: fp32), ("fp16", lambda: to_fp16(fp32, a.img)), ("int8", lambda: to_int8(fp32, calib))):
+        try:
+            rows.append(bench_ort(make(), a.img, a.batch))
+        except Exception as e:
+            print(f"WARNING: {a.backbone} {name} ONNX failed: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            rows.append({"file": f"{a.backbone}_{name}.onnx", "provider": f"error: {type(e).__name__}"})
+    try:
+        eng = build_trt(fp32)
+        if eng:
+            rows.append({"file": eng.name, "provider": "tensorrt"})
+    except Exception as e:
+        print(f"WARNING: TensorRT build failed: {e}", flush=True)
     for r in rows:
         log_result("results/export.jsonl", {"backbone": a.backbone, **r})
 

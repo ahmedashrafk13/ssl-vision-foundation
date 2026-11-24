@@ -39,7 +39,11 @@ def save_checkpoint(state, path, push=True, keep_remote_as=None):
     # write-then-rename: a disconnect mid-save (Colab -> Drive) must never leave a truncated checkpoint
     tmp = path.with_name(path.name + ".tmp")
     torch.save(state, tmp)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except OSError:  # some FUSE mounts refuse rename-over-existing; fall back to delete + rename
+        path.unlink(missing_ok=True)
+        os.rename(tmp, path)
     if push and os.environ.get("HF_PUSH") == "1":  # opt-in: a slow upload must never stall training
         api, repo = _api()
         if api:

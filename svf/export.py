@@ -11,16 +11,51 @@ def export_onnx(model, path, img_size=224, dynamic_batch=True):
     x = torch.randn(1, 3, img_size, img_size)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(model, x, str(path), input_names=["image"], output_names=["out"], opset_version=17,
-                      dynamic_axes={"image": {0: "batch"}, "out": {0: "batch"}} if dynamic_batch else None)
+    kw = dict(input_names=["image"], output_names=["out"], opset_version=17,
+              dynamic_axes={"image": {0: "batch"}, "out": {0: "batch"}} if dynamic_batch else None)
+    try:  # torch >= 2.9 defaults to the dynamo exporter (needs onnxscript); keep the classic one
+        torch.onnx.export(model, x, str(path), dynamo=False, **kw)
+    except TypeError:  # older torch: no `dynamo` argument
+        torch.onnx.export(model, x, str(path), **kw)
     return path
 
 
-def to_fp16(path):
+def ort_session(path, providers):
+    """ONNX Runtime session at ORT_ENABLE_EXTENDED. The default ORT_ENABLE_ALL adds a CPU layout transform
+    that segfaults (access violation, no Python error) while loading the FP16 ViT on onnxruntime 1.32 CPU;
+    EXTENDED keeps every fusion the GPU path uses and is applied to all formats so the comparison stays fair."""
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    return ort.InferenceSession(str(path), so, providers=providers)
+
+
+def to_fp16(path, img_size=96):
+    """FP16 copy of an ONNX model, checked to load in ONNX Runtime and to match the FP32 model.
+
+    onnxconverter-common re-types the outputs of the Cast nodes in ViT attention (the softmax scale) to
+    float16 but leaves their `to=float` attribute, so ONNX Runtime rejects the model ("Type (tensor(float16))
+    of output arg ... does not match expected type (tensor(float))"). Those Casts are re-pointed at float16.
+    (Do NOT retry with "Cast" in op_block_list: the converter then inserts Casts after its own Casts forever.)
+    """
     import onnx
+    from onnx import TensorProto
     from onnxconverter_common import float16
     out = Path(path).with_name(Path(path).stem + "_fp16.onnx")
-    onnx.save(float16.convert_float_to_float16(onnx.load(str(path)), keep_io_types=True), str(out))
+    m = float16.convert_float_to_float16(onnx.load(str(path)), keep_io_types=True)
+    vi = {v.name: v.type.tensor_type.elem_type for v in m.graph.value_info}
+    for node in m.graph.node:
+        if node.op_type == "Cast" and vi.get(node.output[0]) == TensorProto.FLOAT16:
+            for att in node.attribute:
+                if att.name == "to" and att.i == TensorProto.FLOAT:
+                    att.i = TensorProto.FLOAT16
+    onnx.save(m, str(out))
+    x = np.random.randn(2, 3, img_size, img_size).astype(np.float32)
+    ref = ort_session(path, ["CPUExecutionProvider"]).run(None, {"image": x})[0]
+    got = ort_session(out, ["CPUExecutionProvider"]).run(None, {"image": x})[0]
+    err = float(np.abs(got.astype(np.float32) - ref).max() / (np.abs(ref).max() + 1e-6))
+    if not np.isfinite(err) or err > 0.05:
+        raise RuntimeError(f"FP16 model disagrees with FP32 (max rel. error {err:.3g})")
     return out
 
 
@@ -58,7 +93,7 @@ def build_trt(path, fp16=True, int8=False):
 def bench_ort(path, img_size=224, batch=8, iters=50, warmup=10):
     import onnxruntime as ort
     prov = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
-    sess = ort.InferenceSession(str(path), providers=prov)
+    sess = ort_session(path, prov)
     x = np.random.randn(batch, 3, img_size, img_size).astype(np.float32)
     for _ in range(warmup):
         sess.run(None, {"image": x})

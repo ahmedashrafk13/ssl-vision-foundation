@@ -5,7 +5,7 @@ interrupted run resumes from its last saved epoch.
   python scripts/run_grid.py            # full grid (sized for one Colab T4, ~25-30 GPU hours total)
   python scripts/run_grid.py --smoke    # few-step end-to-end check of every stage (~5 min)
 """
-import argparse, atexit, json, os, subprocess, sys, time
+import argparse, atexit, json, os, subprocess, sys, threading, time
 from collections import deque
 from pathlib import Path
 
@@ -15,6 +15,7 @@ IMG = 96
 LOGS = ROOT / "logs" / "grid"  # on Colab logs/ is a symlink into Drive, so these survive a disconnect
 FAILED = []  # (name, exit code, log path, last lines)
 STRICT = False  # smoke: stop at the first failure
+SMOKE_STAGE_TIMEOUT = 20 * 60  # seconds
 
 
 def done_tags(f="results/results.jsonl"):
@@ -31,13 +32,23 @@ def run(cmd, name, retries=1):
     for attempt in range(retries + 1):
         print("\n>>>", " ".join(cmd), f"(retry {attempt})" if attempt else "", flush=True)
         tail = deque(maxlen=40)
+        t0 = time.monotonic()
         with log.open("a", encoding="utf-8", buffering=1) as f:
             f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} attempt {attempt + 1}: {' '.join(cmd)}\n")
             p = subprocess.Popen([PY, "-u", *cmd], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, errors="replace", bufsize=1)
+            # smoke stages take seconds to a few minutes: one that runs 20 min is hung, so kill it and say so
+            # instead of silently burning the Colab session (full-grid stages legitimately run for hours)
+            watchdog = threading.Timer(SMOKE_STAGE_TIMEOUT, p.kill) if STRICT else None
+            if watchdog:
+                watchdog.start()
             for line in p.stdout:
                 sys.stdout.write(line); f.write(line); tail.append(line)
             rc = p.wait()
+            if watchdog:
+                watchdog.cancel()
+                if rc and time.monotonic() - t0 >= SMOKE_STAGE_TIMEOUT - 1:
+                    tail.append(f"\n[run_grid] killed: stage exceeded the {SMOKE_STAGE_TIMEOUT // 60} min smoke limit (hung)\n")
         if rc == 0:
             return True
         print(f"\n!!! {name} FAILED (exit {rc}). Last lines:\n" + "".join(tail), flush=True)
